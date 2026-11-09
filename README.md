@@ -1,6 +1,8 @@
 # FlashKV
 High performance KV storage engine
 
+Hard disk storage, lightweight, high-performance TTL、GC
+
 ---
 
 ## Node.js API：
