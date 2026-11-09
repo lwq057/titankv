@@ -1,7 +1,7 @@
 # FlashKV
 High performance KV storage engine
 
-Hard disk storage, lightweight, high-performance TTL、GC
+Hard disk storage, lightweight, TTL、GC
 
 ---
 
