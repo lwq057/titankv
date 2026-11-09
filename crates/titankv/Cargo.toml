@@ -1,0 +1,32 @@
+[package]
+name = "titankv"
+version = "1.0.0"
+edition = "2021"
+authors = ["TitanKV Contributors"]
+description = "Ultra-high performance persistent Key-Value storage engine with napi-rs bindings"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+napi = { version = "2.16", default-features = false, features = ["napi4", "async", "tokio_rt"] }
+napi-derive = "2.16"
+lz4_flex = "0.11"
+crc32c = "0.6"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+parking_lot = "0.12"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.10", features = ["v4"] }
+tokio = { version = "1.40", features = ["rt", "rt-multi-thread", "sync"] }
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
