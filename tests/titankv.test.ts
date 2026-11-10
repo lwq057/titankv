@@ -259,3 +259,126 @@ test('TitanKV: Crash recovery and log replay persistence', async () => {
 
   await db.close();
 });
+
+test('TitanKV Design2: Overwrite preserves original TTL when options.ttl is not specified', async () => {
+  const dir = path.join(BASE_TEST_DIR, 'test_ttl_preservation');
+  const db = await open({
+    dataDir: dir,
+    global_shardCount: 16,
+    global_bucketCount: 1024,
+  });
+
+  const key = 'user:session:99';
+  await db.put(key, Buffer.from('initial_payload'), { ttl: 80000 });
+  const t1 = await db.ttl(key);
+  assert.ok(t1);
+  assert.ok(t1.expireAt > 0);
+
+  // Overwrite without providing ttl option
+  await db.put(key, Buffer.from('updated_payload'));
+  const t2 = await db.ttl(key);
+  assert.ok(t2);
+  assert.equal(t2.expireAt, t1.expireAt, 'ExpireAt must be strictly preserved across overwrites');
+
+  const val = (await db.get(key)) as Buffer;
+  assert.equal(val.toString(), 'updated_payload');
+
+  await db.close();
+});
+
+test('TitanKV Design2: TTL_UPDATE record log replay preserves updated TTL without value copy', async () => {
+  const dir = path.join(BASE_TEST_DIR, 'test_ttl_update_recovery');
+  let db = await open({
+    dataDir: dir,
+    global_shardCount: 16,
+    global_bucketCount: 1024,
+  });
+
+  const key = 'doc:lease:alpha';
+  await db.put(key, Buffer.from('important_document_body'), { ttl: 40000 });
+  const t1 = await db.ttl(key);
+  assert.ok(t1);
+
+  // Increase TTL by 35000ms -> appends TTL_UPDATE record
+  const t2 = await db.ttl(key, { increase: 35000 });
+  assert.ok(t2);
+  assert.equal(t2.expireAt, t1.expireAt + 35000);
+
+  // Simulate process restart
+  await db.close();
+
+  // Reopen and recover
+  db = await open({
+    dataDir: dir,
+    global_shardCount: 16,
+    global_bucketCount: 1024,
+  });
+
+  const val = (await db.get(key)) as Buffer;
+  assert.ok(val);
+  assert.equal(val.toString(), 'important_document_body');
+
+  const tRecovered = await db.ttl(key);
+  assert.ok(tRecovered);
+  assert.equal(tRecovered.expireAt, t2.expireAt, 'TTL_UPDATE must be replayed into Index during crash recovery');
+
+  await db.close();
+});
+
+test('TitanKV Design2: Permanent key reduce rejects with TTL_NOT_SET & ttl_compare requires ttl', async () => {
+  const dir = path.join(BASE_TEST_DIR, 'test_error_codes');
+  const db = await open({
+    dataDir: dir,
+    global_shardCount: 16,
+    global_bucketCount: 1024,
+  });
+
+  // 1. Permanent key reduce
+  await db.put('perm:key', Buffer.from('permanent_data'));
+  await assert.rejects(
+    async () => {
+      await db.ttl('perm:key', { reduce: 5000 });
+    },
+    (err: any) => {
+      return err.message.includes('TTL_NOT_SET');
+    }
+  );
+
+  // 2. ttl_compare without ttl option
+  await assert.rejects(
+    async () => {
+      await db.put('perm:key', Buffer.from('data_v2'), { mode: 'ttl_compare' });
+    },
+    (err: any) => {
+      return err.message.includes('INVALID_CONFIG');
+    }
+  );
+
+  await db.close();
+});
+
+test('TitanKV Design2: Tombstone records prevent resurrecting older PUTs during reload', async () => {
+  const dir = path.join(BASE_TEST_DIR, 'test_tombstone_protection');
+  let db = await open({
+    dataDir: dir,
+    global_shardCount: 16,
+    global_bucketCount: 1024,
+  });
+
+  await db.put('tomb:k1', Buffer.from('alive_v1'));
+  await db.delete('tomb:k1');
+  assert.equal(await db.get('tomb:k1'), null);
+
+  await db.close();
+
+  // Reopen
+  db = await open({
+    dataDir: dir,
+    global_shardCount: 16,
+    global_bucketCount: 1024,
+  });
+
+  assert.equal(await db.get('tomb:k1'), null, 'Tombstone must prevent older PUT from resurrecting');
+  await db.close();
+});
+

@@ -3,8 +3,11 @@ use crate::concurrency::process_lock::ProcessLockManager;
 use crate::concurrency::shard::ShardRouter;
 use crate::error::TitanError;
 use crate::index::bucket::BucketManager;
-use crate::index::record::IndexRecord;
-use crate::log::record::{decode_log_record, encode_log_record, RECORD_TYPE_PUT};
+use crate::index::record::FLAG_TOMBSTONE;
+use crate::log::record::{
+    decode_log_record, encode_log_record, encode_ttl_update_record,
+    RECORD_TYPE_PUT, RECORD_TYPE_TOMBSTONE, RECORD_TYPE_TTL_UPDATE,
+};
 use crate::log::segment::Segment;
 use crate::log::writer::LaneWriter;
 use crate::persistence::manifest::ManifestManager;
@@ -90,64 +93,128 @@ impl SegmentGcCollector {
             while offset < data.len() && relocated < batch_limit {
                 let remaining = &data[offset..];
                 match decode_log_record(remaining) {
-                    Ok((header, key, value, rec_len)) => {
-                        if header.record_type == RECORD_TYPE_PUT {
-                            let route = router.route(key);
-                            let _local_guard = local_lock.write(route.global_bucket_id);
-                            let _proc_guard = process_lock.lock_bucket_exclusive(route.global_bucket_id)?;
+                    Ok((header, key, value_slice, rec_len)) => {
+                        let route = router.route(key);
+                        let _local_guard = local_lock.write(route.global_bucket_id);
+                        let _proc_guard = process_lock.lock_bucket_exclusive(route.global_bucket_id)?;
 
-                            if let Ok(Some(current_index)) = bucket_mgr.get_record(
-                                route.shard_id,
-                                route.local_bucket_id,
-                                key,
-                                route.hash,
-                            ) {
-                                // Verify it still points to this exact segment and offset
-                                if current_index.segment_id == seg_id
+                        if let Ok(Some(mut current_index)) = bucket_mgr.get_record(
+                            route.shard_id,
+                            route.local_bucket_id,
+                            key,
+                            route.hash,
+                        ) {
+                            let lane_idx = route.lane_id % writers.len();
+
+                            if header.record_type == RECORD_TYPE_PUT {
+                                // Check if this segment contains the active Value
+                                if current_index.value_segment_id == seg_id
                                     && current_index.value_offset == offset as u64
                                     && !current_index.is_expired(now_ms)
+                                    && !current_index.is_tombstone()
                                 {
-                                    // Relocate: preserve sequence, increment relocation_generation
-                                    let new_reloc = current_index.relocation_generation + 1;
+                                    let new_val_reloc = current_index.value_relocation_generation + 1;
                                     let mut new_log_buf = Vec::new();
                                     encode_log_record(
                                         RECORD_TYPE_PUT,
                                         header.flags,
                                         header.sequence,
                                         header.expire_at,
-                                        new_reloc,
+                                        new_val_reloc,
                                         key,
                                         header.raw_value_len,
-                                        value,
+                                        value_slice,
                                         &mut new_log_buf,
                                     );
 
-                                    let lane_idx = route.lane_id % writers.len();
-                                    if let Ok((new_seg_id, new_offset)) =
-                                        writers[lane_idx].append(&new_log_buf)
-                                    {
-                                        let updated_index = IndexRecord {
-                                            hash: current_index.hash,
-                                            key: key.to_vec(),
-                                            segment_id: new_seg_id,
-                                            value_offset: new_offset,
-                                            stored_len: header.stored_value_len,
-                                            raw_len: header.raw_value_len,
-                                            expire_at: header.expire_at,
-                                            sequence: header.sequence,
-                                            relocation_generation: new_reloc,
-                                            flags: header.flags,
-                                        };
+                                    if let Ok((new_seg_id, new_offset)) = writers[lane_idx].append(&new_log_buf) {
+                                        current_index.value_segment_id = new_seg_id.clone();
+                                        current_index.value_offset = new_offset;
+                                        current_index.value_relocation_generation = new_val_reloc;
+                                        if current_index.state_segment_id == seg_id
+                                            && current_index.state_offset == offset as u64
+                                        {
+                                            current_index.state_segment_id = new_seg_id;
+                                            current_index.state_offset = new_offset;
+                                            current_index.state_relocation_generation = new_val_reloc;
+                                        }
                                         let _ = bucket_mgr.upsert_record(
                                             route.shard_id,
                                             route.local_bucket_id,
-                                            updated_index,
+                                            current_index,
+                                        );
+                                        relocated += 1;
+                                    }
+                                }
+                            } else if header.record_type == RECORD_TYPE_TTL_UPDATE {
+                                // Check if this segment contains the active TTL_UPDATE state
+                                if current_index.state_segment_id == seg_id
+                                    && current_index.state_offset == offset as u64
+                                    && !current_index.is_expired(now_ms)
+                                    && !current_index.is_tombstone()
+                                {
+                                    let new_state_reloc = current_index.state_relocation_generation + 1;
+                                    let mut new_log_buf = Vec::new();
+                                    encode_ttl_update_record(
+                                        header.sequence,
+                                        header.expire_at,
+                                        new_state_reloc,
+                                        key,
+                                        &current_index.value_segment_id,
+                                        current_index.value_offset,
+                                        current_index.stored_len,
+                                        current_index.raw_len,
+                                        current_index.flags,
+                                        current_index.value_relocation_generation,
+                                        &mut new_log_buf,
+                                    );
+
+                                    if let Ok((new_seg_id, new_offset)) = writers[lane_idx].append(&new_log_buf) {
+                                        current_index.state_segment_id = new_seg_id;
+                                        current_index.state_offset = new_offset;
+                                        current_index.state_relocation_generation = new_state_reloc;
+                                        let _ = bucket_mgr.upsert_record(
+                                            route.shard_id,
+                                            route.local_bucket_id,
+                                            current_index,
+                                        );
+                                        relocated += 1;
+                                    }
+                                }
+                            } else if header.record_type == RECORD_TYPE_TOMBSTONE {
+                                if current_index.state_segment_id == seg_id
+                                    && current_index.state_offset == offset as u64
+                                    && current_index.is_tombstone()
+                                {
+                                    let new_state_reloc = current_index.state_relocation_generation + 1;
+                                    let mut new_log_buf = Vec::new();
+                                    encode_log_record(
+                                        RECORD_TYPE_TOMBSTONE,
+                                        FLAG_TOMBSTONE,
+                                        header.sequence,
+                                        0,
+                                        new_state_reloc,
+                                        key,
+                                        0,
+                                        &[],
+                                        &mut new_log_buf,
+                                    );
+
+                                    if let Ok((new_seg_id, new_offset)) = writers[lane_idx].append(&new_log_buf) {
+                                        current_index.state_segment_id = new_seg_id;
+                                        current_index.state_offset = new_offset;
+                                        current_index.state_relocation_generation = new_state_reloc;
+                                        let _ = bucket_mgr.upsert_record(
+                                            route.shard_id,
+                                            route.local_bucket_id,
+                                            current_index,
                                         );
                                         relocated += 1;
                                     }
                                 }
                             }
                         }
+
                         offset += rec_len;
                     }
                     Err(_) => break,

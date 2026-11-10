@@ -37,14 +37,26 @@ impl TtlDiskManager {
         let time_bucket = (event.expire_at as u64) / self.ttl_bucket_width_ms;
         let file_path = self.base_dir.join(format!("bucket-{}.ttl", time_bucket));
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(file_path)?;
+        let write_res = (|| -> Result<(), std::io::Error> {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file_path)?;
+            let mut buf = Vec::new();
+            event.encode(&mut buf);
+            file.write_all(&buf)?;
+            Ok(())
+        })();
 
-        let mut buf = Vec::new();
-        event.encode(&mut buf);
-        file.write_all(&buf)?;
+        if let Err(e) = write_res {
+            let flag_path = self.base_dir.join("needs-rebuild.flag");
+            if std::fs::write(&flag_path, b"1").is_err() {
+                return Err(TitanError::RecoveryRequired(format!(
+                    "Failed to append TTL event and failed to write needs-rebuild.flag: {}",
+                    e
+                )));
+            }
+        }
         Ok(())
     }
 }

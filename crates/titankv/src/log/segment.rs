@@ -1,6 +1,6 @@
 use crate::error::TitanError;
+use crate::io::{pread_exact, pwrite_all};
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -73,8 +73,8 @@ impl Segment {
 
     pub fn open_or_create<P: AsRef<Path>>(
         data_dir: P,
-        process_uuid: &str,
-        lane_id: usize,
+        _process_uuid: &str,
+        _lane_id: usize,
         segment_id: &str,
     ) -> Result<Arc<Self>, TitanError> {
         Self::open_by_id(data_dir, segment_id)
@@ -82,14 +82,14 @@ impl Segment {
 
     pub fn append(&self, data: &[u8]) -> Result<u64, TitanError> {
         let offset = self.current_offset.fetch_add(data.len() as u64, Ordering::SeqCst);
-        self.file.write_all_at(data, offset)?;
+        pwrite_all(&self.file, data, offset)?;
         self.total_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
         self.live_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
         Ok(offset)
     }
 
     pub fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), TitanError> {
-        self.file.read_exact_at(buf, offset)?;
+        pread_exact(&self.file, buf, offset)?;
         Ok(())
     }
 

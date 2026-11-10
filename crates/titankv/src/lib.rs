@@ -6,6 +6,7 @@ pub mod engine;
 pub mod error;
 pub mod gc;
 pub mod index;
+pub mod io;
 pub mod log;
 pub mod memory;
 pub mod napi;

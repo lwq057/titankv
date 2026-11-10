@@ -12,7 +12,10 @@ use crate::gc::collector::SegmentGcCollector;
 use crate::index::allocator::OverflowAllocator;
 use crate::index::bucket::BucketManager;
 use crate::index::record::{IndexRecord, FLAG_TOMBSTONE};
-use crate::log::record::{decode_log_record, encode_log_record, RECORD_TYPE_PUT, RECORD_TYPE_TOMBSTONE};
+use crate::log::record::{
+    decode_log_record, encode_log_record, encode_ttl_update_record, LOG_HEADER_SIZE,
+    LOG_TRAILER_SIZE, RECORD_TYPE_PUT, RECORD_TYPE_TOMBSTONE,
+};
 use crate::log::recovery::replay_logs;
 use crate::log::segment::Segment;
 use crate::log::writer::LaneWriter;
@@ -160,9 +163,11 @@ impl TitanEngine {
 
         // Perform recovery replay if primary/sole process
         let mut initial_keys = 0u64;
+        let mut initial_seq = 0u64;
         if lifecycle.is_primary_recovered {
             if let Ok(stats) = replay_logs(&config.data_dir, &router, &bucket_mgr) {
                 initial_keys = stats.live_keys as u64;
+                initial_seq = stats.max_sequence;
             }
         }
 
@@ -201,7 +206,7 @@ impl TitanEngine {
 
         let ttl_cleaner = Arc::new(TtlCleaner::new(config.ttl.heap_capacity));
         let gc_collector = Arc::new(SegmentGcCollector::new());
-        let sequence_gen = Arc::new(AtomicU64::new(100));
+        let sequence_gen = Arc::new(AtomicU64::new(initial_seq.max(100) + 10));
         let total_keys = Arc::new(AtomicU64::new(initial_keys));
         let live_bytes = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
@@ -298,14 +303,6 @@ impl TitanEngine {
             .unwrap()
             .as_millis() as i64;
 
-        // Calculate expireAt
-        let expire_at = match options.and_then(|o| o.ttl) {
-            Some(-1) => -1,
-            Some(0) => now_ms,
-            Some(t) if t > 0 => now_ms + t,
-            _ => -1, // Permanent by default for new key
-        };
-
         let global_lane_id = route.shard_id * self.config.concurrency.writer_lanes_per_shard + route.lane_id;
         let _lane_guard = self.lane_mgr.lock_lane(global_lane_id);
 
@@ -318,8 +315,30 @@ impl TitanEngine {
             .bucket_mgr
             .get_record(route.shard_id, route.local_bucket_id, key_bytes, route.hash)?;
 
+        // Calculate expireAt per Section 12.2:
+        // - 新 Key 未指定 TTL：永久有效 (-1)
+        // - 已有 Key 覆盖时未指定 TTL：保留原 TTL
+        // - 显式 ttl=-1：永久有效
+        // - 显式 ttl=0：立即过期
+        let expire_at = match options.and_then(|o| o.ttl) {
+            Some(-1) => -1,
+            Some(0) => now_ms,
+            Some(t) if t > 0 => now_ms + t,
+            _ => {
+                if let Some(ref old_rec) = existing {
+                    if !old_rec.is_tombstone() && !old_rec.is_expired(now_ms) {
+                        old_rec.expire_at
+                    } else {
+                        -1
+                    }
+                } else {
+                    -1
+                }
+            }
+        };
+
         if let Some(ref old_rec) = existing {
-            let old_valid = !old_rec.is_expired(now_ms);
+            let old_valid = !old_rec.is_tombstone() && !old_rec.is_expired(now_ms);
 
             match mode {
                 "skip" => {
@@ -328,27 +347,42 @@ impl TitanEngine {
                     }
                 }
                 "ttl_compare" => {
-                    if expire_at == -1 {
-                        // New key is permanent: allowed to overwrite finite TTL
-                    } else if old_rec.expire_at == -1 {
-                        // Old is permanent, new is finite: reject
-                        return Ok(false);
-                    } else {
-                        // Both are finite
-                        if expire_at - old_rec.expire_at < ttl_diff {
+                    if options.and_then(|o| o.ttl).is_none() {
+                        return Err(TitanError::InvalidConfig("ttl_compare mode requires ttl option".into()));
+                    }
+                    if old_valid {
+                        if expire_at == -1 {
+                            // New key is permanent: allowed to overwrite finite TTL
+                        } else if old_rec.expire_at == -1 {
+                            // Old is permanent, new is finite: reject
                             return Ok(false);
+                        } else {
+                            // Both are finite
+                            if expire_at - old_rec.expire_at < ttl_diff {
+                                return Ok(false);
+                            }
                         }
                     }
                 }
                 _ => {} // "overwrite"
             }
+        } else if mode == "ttl_compare" && options.and_then(|o| o.ttl).is_none() {
+            return Err(TitanError::InvalidConfig("ttl_compare mode requires ttl option".into()));
         }
 
         // Compress value if applicable
         let compressed = compress_value(value, &self.config.compression);
 
-        // Sequence number allocation inside bucket lock
-        let seq = self.sequence_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        // Sequence number allocation inside bucket lock - strictly monotonic per key
+        let old_seq = existing.as_ref().map(|r| r.sequence).unwrap_or(0);
+        let allocated = self.sequence_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let seq = if allocated <= old_seq {
+            let next_seq = old_seq + 1;
+            self.sequence_gen.fetch_max(next_seq + 1, Ordering::SeqCst);
+            next_seq
+        } else {
+            allocated
+        };
 
         // Encode and append Log Record
         let mut log_buf = Vec::new();
@@ -385,18 +419,21 @@ impl TitanEngine {
             self.ttl_cleaner.schedule_event(ttl_event);
         }
 
-        // Update Index Record
+        // Update Index Record with dual pointers
         let is_new = existing.as_ref().map(|r| r.is_tombstone()).unwrap_or(true);
         let index_rec = IndexRecord {
             hash: route.hash,
             key: key_bytes.to_vec(),
-            segment_id: seg_id,
+            state_segment_id: seg_id.clone(),
+            state_offset: offset,
+            value_segment_id: seg_id,
             value_offset: offset,
             stored_len: compressed.stored_len,
             raw_len: compressed.raw_len,
             expire_at,
             sequence: seq,
-            relocation_generation: 0,
+            state_relocation_generation: 0,
+            value_relocation_generation: 0,
             flags: compressed.flags,
         };
 
@@ -483,14 +520,14 @@ impl TitanEngine {
         // Get segment arc and pin it
         let seg_arc = {
             let mut segs = self.open_segments.lock();
-            if let Some(s) = segs.get(&index_rec.segment_id) {
+            if let Some(s) = segs.get(&index_rec.value_segment_id) {
                 Arc::clone(s)
             } else {
                 let seg = Segment::open_by_id(
                     &self.config.data_dir,
-                    &index_rec.segment_id,
+                    &index_rec.value_segment_id,
                 )?;
-                segs.insert(index_rec.segment_id.clone(), Arc::clone(&seg));
+                segs.insert(index_rec.value_segment_id.clone(), Arc::clone(&seg));
                 seg
             }
         };
@@ -501,9 +538,8 @@ impl TitanEngine {
         drop(_proc_guard);
         drop(_local_guard);
 
-        // Read log record from segment
-        // Header is 42 bytes, then key, then value, then 8 bytes trailer
-        let total_rec_len = 42 + (index_rec.key.len()) + (index_rec.stored_len as usize) + 8;
+        // Read log record from segment using header + key + stored value + trailer
+        let total_rec_len = LOG_HEADER_SIZE + (index_rec.key.len()) + (index_rec.stored_len as usize) + LOG_TRAILER_SIZE;
         let mut rec_buf = vec![0u8; total_rec_len];
         seg_arc.read_exact_at(&mut rec_buf, index_rec.value_offset)?;
 
@@ -511,7 +547,9 @@ impl TitanEngine {
 
         let val_bytes = decompress_value(stored_val, header.flags, header.raw_value_len)?;
 
-        let ttl_remaining = if index_rec.expire_at > 0 {
+        let ttl_remaining = if index_rec.expire_at == -1 {
+            -1
+        } else if index_rec.expire_at > 0 {
             (index_rec.expire_at - now_ms).max(0)
         } else {
             -1
@@ -529,9 +567,15 @@ impl TitanEngine {
         keys: &[String],
         options: Option<&GetOptions>,
     ) -> Result<Vec<Option<GetResult>>, TitanError> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(TitanError::DatabaseClosed);
+        }
         let mut results = Vec::with_capacity(keys.len());
         for k in keys {
-            results.push(self.get(k, options)?);
+            match self.get(k, options) {
+                Ok(res) => results.push(res),
+                Err(_) => results.push(None),
+            }
         }
         Ok(results)
     }
@@ -553,7 +597,19 @@ impl TitanEngine {
         let _local_guard = self.local_lock.write(route.global_bucket_id);
         let _proc_guard = self.process_lock.lock_bucket_exclusive(route.global_bucket_id)?;
 
-        let seq = self.sequence_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let existing = self
+            .bucket_mgr
+            .get_record(route.shard_id, route.local_bucket_id, key_bytes, route.hash)?;
+
+        let old_seq = existing.as_ref().map(|r| r.sequence).unwrap_or(0);
+        let allocated = self.sequence_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let seq = if allocated <= old_seq {
+            let next_seq = old_seq + 1;
+            self.sequence_gen.fetch_max(next_seq + 1, Ordering::SeqCst);
+            next_seq
+        } else {
+            allocated
+        };
         let mut log_buf = Vec::new();
         encode_log_record(
             RECORD_TYPE_TOMBSTONE,
@@ -569,23 +625,61 @@ impl TitanEngine {
 
         let lane_idx = global_lane_id % self.writers.len();
         let writer = &self.writers[lane_idx];
-        let _ = writer.append(&log_buf)?;
+        let (tomb_seg_id, tomb_offset) = writer.append(&log_buf)?;
 
-        let removed = self
-            .bucket_mgr
-            .delete_record(route.shard_id, route.local_bucket_id, key_bytes, route.hash)?;
+        let was_active = if let Some(ref old_rec) = existing {
+            !old_rec.is_tombstone()
+        } else {
+            false
+        };
 
-        if removed {
-            self.total_keys.fetch_sub(1, Ordering::Relaxed);
+        let tombstone_rec = IndexRecord {
+            hash: route.hash,
+            key: key_bytes.to_vec(),
+            state_segment_id: tomb_seg_id,
+            state_offset: tomb_offset,
+            value_segment_id: String::new(),
+            value_offset: 0,
+            stored_len: 0,
+            raw_len: 0,
+            expire_at: 0,
+            sequence: seq,
+            state_relocation_generation: 0,
+            value_relocation_generation: 0,
+            flags: FLAG_TOMBSTONE,
+        };
+
+        self.bucket_mgr
+            .upsert_record(route.shard_id, route.local_bucket_id, tombstone_rec)?;
+
+        if was_active {
+            let mut cur = self.total_keys.load(Ordering::Relaxed);
+            while cur > 0 {
+                match self.total_keys.compare_exchange_weak(
+                    cur,
+                    cur - 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
+            }
         }
 
-        Ok(removed)
+        Ok(true)
     }
 
     pub fn delete_many(&self, keys: &[String]) -> Result<Vec<bool>, TitanError> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(TitanError::DatabaseClosed);
+        }
         let mut results = Vec::with_capacity(keys.len());
         for k in keys {
-            results.push(self.delete(k)?);
+            match self.delete(k) {
+                Ok(res) => results.push(res),
+                Err(_) => results.push(false),
+            }
         }
         Ok(results)
     }
@@ -612,7 +706,9 @@ impl TitanEngine {
                 if rec.is_tombstone() {
                     return Ok(None);
                 }
-                let ttl_rem = if rec.expire_at > 0 {
+                let ttl_rem = if rec.expire_at == -1 {
+                    -1
+                } else if rec.expire_at > 0 {
                     (rec.expire_at - now_ms).max(0)
                 } else {
                     -1
@@ -663,8 +759,40 @@ impl TitanEngine {
             rec.expire_at
         };
 
+        let allocated = self.sequence_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let seq = if allocated <= rec.sequence {
+            let next_seq = rec.sequence + 1;
+            self.sequence_gen.fetch_max(next_seq + 1, Ordering::SeqCst);
+            next_seq
+        } else {
+            allocated
+        };
+
+        // Log TTL_UPDATE into Value Log (Section 4.2 & 8.5)
+        let mut log_buf = Vec::new();
+        encode_ttl_update_record(
+            seq,
+            new_expire_at,
+            0,
+            key_bytes,
+            &rec.value_segment_id,
+            rec.value_offset,
+            rec.stored_len,
+            rec.raw_len,
+            rec.flags,
+            rec.value_relocation_generation,
+            &mut log_buf,
+        );
+
+        let lane_idx = global_lane_id % self.writers.len();
+        let writer = &self.writers[lane_idx];
+        let (ttl_seg_id, ttl_offset) = writer.append(&log_buf)?;
+
+        rec.state_segment_id = ttl_seg_id;
+        rec.state_offset = ttl_offset;
         rec.expire_at = new_expire_at;
-        rec.sequence = self.sequence_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        rec.sequence = seq;
+        rec.state_relocation_generation = 0;
 
         // Log TTL update event
         if new_expire_at > 0 {
@@ -675,14 +803,15 @@ impl TitanEngine {
                 sequence: rec.sequence,
                 key: key_bytes.to_vec(),
             };
-            let lane_idx = global_lane_id % self.ttl_disk_mgrs.len();
             let _ = self.ttl_disk_mgrs[lane_idx].append_event(&ttl_event);
             self.ttl_cleaner.schedule_event(ttl_event);
         }
 
         self.bucket_mgr.upsert_record(route.shard_id, route.local_bucket_id, rec)?;
 
-        let ttl_rem = if new_expire_at > 0 {
+        let ttl_rem = if new_expire_at == -1 {
+            -1
+        } else if new_expire_at > 0 {
             (new_expire_at - now_ms).max(0)
         } else {
             -1
@@ -695,6 +824,9 @@ impl TitanEngine {
     }
 
     pub fn ttl_many(&self, items: &[TtlItem]) -> Result<Vec<Option<TtlResult>>, TitanError> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(TitanError::DatabaseClosed);
+        }
         let mut results = Vec::with_capacity(items.len());
         for it in items {
             let opts = TtlOptions {
@@ -702,7 +834,10 @@ impl TitanEngine {
                 increase: it.increase,
                 reduce: it.reduce,
             };
-            results.push(self.ttl(&it.key, Some(&opts))?);
+            match self.ttl(&it.key, Some(&opts)) {
+                Ok(res) => results.push(res),
+                Err(_) => results.push(None),
+            }
         }
         Ok(results)
     }

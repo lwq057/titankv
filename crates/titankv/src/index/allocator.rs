@@ -1,6 +1,6 @@
 use crate::error::TitanError;
+use crate::io::{pread_exact, pwrite_all};
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -49,6 +49,11 @@ impl OverflowAllocator {
     }
 
     pub fn allocate_overflow_page(&self) -> u32 {
+        if let Ok(meta) = self.file.metadata() {
+            let disk_pages = (meta.len() / 4096) as u32;
+            let min_page = (self.buckets_per_shard as u32).max(disk_pages);
+            self.next_page_id.fetch_max(min_page, Ordering::SeqCst);
+        }
         self.next_page_id.fetch_add(1, Ordering::SeqCst)
     }
 
@@ -59,13 +64,13 @@ impl OverflowAllocator {
             buf.fill(0);
             return Ok(());
         }
-        self.file.read_exact_at(buf, offset)?;
+        pread_exact(&self.file, buf, offset)?;
         Ok(())
     }
 
     pub fn write_page(&self, page_id: u32, buf: &[u8]) -> Result<(), TitanError> {
         let offset = page_id as u64 * 4096;
-        self.file.write_all_at(buf, offset)?;
+        pwrite_all(&self.file, buf, offset)?;
         Ok(())
     }
 }

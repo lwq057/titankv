@@ -8,7 +8,7 @@ use crate::log::writer::LaneWriter;
 use crate::ttl::event::TtlEvent;
 use crate::ttl::heap::BoundedTtlHeap;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -74,7 +74,7 @@ impl TtlCleaner {
                         0,
                         seq,
                         0,
-                        rec.relocation_generation,
+                        rec.relocation_generation(),
                         &item.key,
                         0,
                         &[],
@@ -82,9 +82,24 @@ impl TtlCleaner {
                     );
 
                     let lane_idx = route.lane_id % writers.len();
-                    let _ = writers[lane_idx].append(&log_buf);
+                    let (seg_id, offset) = writers[lane_idx].append(&log_buf).unwrap_or((String::new(), 0));
 
-                    let _ = bucket_mgr.delete_record(route.shard_id, route.local_bucket_id, &item.key, route.hash);
+                    let tombstone_rec = crate::index::record::IndexRecord {
+                        hash: route.hash,
+                        key: item.key.clone(),
+                        state_segment_id: seg_id,
+                        state_offset: offset,
+                        state_relocation_generation: rec.relocation_generation(),
+                        value_segment_id: String::new(),
+                        value_offset: 0,
+                        value_relocation_generation: 0,
+                        stored_len: 0,
+                        raw_len: 0,
+                        expire_at: 0,
+                        sequence: seq,
+                        flags: crate::index::record::FLAG_TOMBSTONE,
+                    };
+                    let _ = bucket_mgr.upsert_record(route.shard_id, route.local_bucket_id, tombstone_rec);
                     cleaned += 1;
                 }
             }
